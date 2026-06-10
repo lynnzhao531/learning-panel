@@ -576,4 +576,322 @@ html, body {
   .wcell { min-height: 76px; padding: 6px 4px; }
   .wcell-sc { display: none; }
   .stats-top { flex-direction: column; align-items: flex-start; }
+  .reason-grid { grid-template-columns: 1fr; }
+  .light-grid { grid-template-columns: 1fr; }
 }
+
+/* =====================================================================
+   Phase 3 — persist, book days, light lane, conditional activation,
+   add-course, export/import. Calm + zero-guilt: advice is a nudge, never
+   a warning; "persist" is always framed as the win.
+   ===================================================================== */
+
+/* ---- shared button variants ---------------------------------------- */
+.btn.ghost {
+  background: #f7f8fb;
+  color: var(--ink-soft);
+  border-color: var(--line);
+  box-shadow: none;
+}
+.btn.ghost:hover { background: #eef1f6; }
+.btn.tiny { font-size: 12px; padding: 5px 10px; border-radius: 10px; }
+.header-export {
+  align-self: flex-start;
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 10px;
+  font-size: 14px;
+  line-height: 1;
+  padding: 5px 9px;
+  cursor: pointer;
+  box-shadow: var(--shadow-soft);
+}
+.header-export:hover { background: #f7f8fb; }
+.linkish {
+  background: none;
+  border: none;
+  color: var(--ink-faint);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 4px 2px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.linkish:hover { color: var(--ink-soft); }
+
+/* ---- Sunday backup banner ------------------------------------------ */
+.backup-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px;
+  background: #fff7e6;
+  border: 1px solid #ffe6b0;
+}
+.bb-text { font-size: 14px; font-weight: 600; color: #9a6b00; }
+.bb-actions { display: flex; align-items: center; gap: 8px; }
+.bb-dismiss, .advice-dismiss {
+  background: none;
+  border: none;
+  color: var(--ink-faint);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.bb-dismiss:hover, .advice-dismiss:hover { color: var(--ink-soft); }
+
+/* ---- persist row + weekly ring ------------------------------------- */
+.persist-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.persist-btn { white-space: nowrap; }
+.persist-ring {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink-soft);
+  background: #f1f3f8;
+  border-radius: 999px;
+  padding: 5px 12px;
+}
+.persist-ring.full { background: #e8f7ee; color: #1f8a4c; }
+
+/* ---- reason sheet -------------------------------------------------- */
+.reason-sheet {
+  margin-top: 14px;
+  padding: 16px;
+  background: #fafbfd;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.reason-head { font-size: 14px; font-weight: 700; margin-bottom: 12px; }
+.reason-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.btn.reason { justify-content: flex-start; font-size: 14px; }
+
+/* ---- persist advice banner ----------------------------------------- */
+.advice {
+  position: relative;
+  margin-top: 14px;
+  padding: 16px 18px;
+  background: #f3f8ff;
+  border: 1px solid #d9e8ff;
+  border-radius: 12px;
+}
+.advice.escalated { background: #f6f2ff; border-color: #e2d8ff; }
+.advice-dismiss { position: absolute; top: 8px; right: 8px; }
+.advice-head { font-size: 14px; font-weight: 700; margin-bottom: 6px; }
+.advice-zone { font-size: 13px; color: var(--ink-soft); margin-bottom: 6px; }
+.advice-zone .zk { text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; }
+.advice-text { font-size: 14px; line-height: 1.5; }
+.advice-tip { font-size: 13px; color: var(--ink-soft); margin-top: 8px; }
+.btn.raid { margin-top: 10px; }
+
+/* ---- copy box (AI prompt) ------------------------------------------ */
+.copybox {
+  margin-top: 12px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  background: #fff;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.copybox:hover { border-color: var(--primary); }
+.copybox.copied { border-color: #1f8a4c; background: #f2fbf5; }
+.copybox-label { font-size: 11px; font-weight: 700; color: var(--ink-faint); padding: 8px 12px 0; }
+.copybox.copied .copybox-label::after { content: "  ✓ copied"; color: #1f8a4c; }
+.copybox-pre {
+  margin: 6px 0 0;
+  padding: 8px 12px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---- book days ----------------------------------------------------- */
+.book-active {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding: 12px 16px;
+  background: #fbf7f0;
+  border: 1px solid #efe2cf;
+  border-radius: 12px;
+}
+.book-title { font-size: 14px; font-weight: 700; margin-right: auto; }
+.book-sheet {
+  margin-top: 14px;
+  padding: 16px;
+  background: #fafbfd;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.book-fields { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.book-title-input, .ac-jsonbox, .addcourse input[type="text"],
+.addcourse input[type="number"], .addcourse select {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--ink);
+  background: #fff;
+}
+.book-title-input { flex: 1 1 200px; }
+
+/* ---- light lane ---------------------------------------------------- */
+.light-sheet {
+  margin-top: 14px;
+  padding: 16px;
+  background: #f4fbf6;
+  border: 1px solid #d6efdf;
+  border-radius: 12px;
+}
+.light-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+  margin: 12px 0;
+}
+.light-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  text-align: left;
+  border: 1px solid #d6efdf;
+  background: #fff;
+  border-radius: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: transform 80ms ease, box-shadow 120ms ease;
+}
+.light-chip:hover { transform: translateY(-1px); box-shadow: var(--shadow-soft); }
+.light-chip:disabled { opacity: 0.5; cursor: default; }
+.lc-title { font-size: 14px; font-weight: 700; }
+.lc-sub { font-size: 12px; color: var(--ink-soft); }
+
+/* ---- today card: light-mode + footer ------------------------------- */
+.today-card.light-mode { background: #f7fcf9; }
+.pick-note {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-faint);
+  margin-bottom: 10px;
+}
+.pick-note.light { color: #1f8a4c; }
+.pick-note a { color: inherit; }
+.today-footer {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+/* ---- queue head + add-course + parked ------------------------------ */
+.queue-head { display: flex; justify-content: flex-end; margin-top: 14px; }
+.queue-notice {
+  margin-top: 12px;
+  padding: 12px 16px;
+  background: #fff7e6;
+  border: 1px solid #ffe6b0;
+  border-radius: 12px;
+  font-size: 13px;
+  color: #9a6b00;
+}
+.addcourse { margin-top: 12px; }
+.ac-tabs { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+.ac-tab {
+  border: 1px solid var(--line);
+  background: #f7f8fb;
+  color: var(--ink-soft);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 14px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.ac-tab.active { background: var(--primary); color: var(--primary-ink); border-color: transparent; }
+.ac-close { margin-left: auto; }
+.ac-json, .ac-manual { display: flex; flex-direction: column; gap: 10px; }
+.ac-jsonbox { min-height: 120px; resize: vertical; }
+.ac-diff { display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--ink-soft); }
+.ac-diffout { font-weight: 700; color: var(--ink); min-width: 1.5em; text-align: center; }
+.ac-difficulty { flex: 1 1 auto; }
+.ac-prereq-label { font-size: 13px; color: var(--ink-soft); }
+.ac-prereqs { min-height: 110px; }
+.ac-confirm-head { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+.ac-summary { font-size: 14px; color: var(--ink-soft); margin-bottom: 6px; }
+.ac-landing {
+  font-size: 14px;
+  background: #f3f8ff;
+  border: 1px solid #d9e8ff;
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+.ac-confirm-actions { display: flex; align-items: center; gap: 12px; }
+
+.parked { margin-top: 22px; }
+.parked-head {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+.parked-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  background: #fafbfd;
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  margin-bottom: 8px;
+  opacity: 0.85;
+}
+.parked-note { font-size: 12px; color: var(--ink-soft); }
+
+/* ---- stats: persistence-this-week + backup controls ---------------- */
+.persist-week .pw-head {
+  font-size: 16px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.pw-row { font-size: 13px; color: var(--ink-soft); padding: 5px 0; border-top: 1px solid var(--line); }
+.pw-row:first-of-type { border-top: none; }
+.pw-day { font-weight: 700; color: var(--ink); }
+.pw-course { font-weight: 600; color: var(--ink); }
+.pw-through { color: #1f8a4c; font-weight: 600; }
+.pw-empty { font-size: 14px; color: var(--ink-faint); }
+
+.backup-controls .bc-head {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+.bc-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.import-label { position: relative; overflow: hidden; }
+.bc-last { font-size: 12px; color: var(--ink-faint); margin-top: 10px; }
