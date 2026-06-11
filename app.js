@@ -38,9 +38,13 @@
   /* STATE ENGINE                                                       */
   /* ================================================================== */
 
+  // Phase 4: section last-write timestamps (LWW for the merge). Missing entry
+  // is treated as EPOCH by the merge, so a fresh default omits them.
+  var EPOCH = new Date(0).toISOString();
+
   var DEFAULT_STATE = function () {
     return {
-      version: 1,
+      version: 2,                      // Phase 4: bumped from 1 (event ids + touched)
       activeCourseId: null,
       currentBook: null,
       events: [],
@@ -51,7 +55,8 @@
         lightLane: null,               // Phase 3 (authorized): {day, courseId}|null
         lastExportDay: null,           // Phase 3 (authorized)
         backupBannerDismissedFor: null // Phase 3 (authorized)
-      }
+      },
+      touched: {}                      // Phase 4 (authorized): section -> ISO of last local write
     };
   };
 
@@ -91,15 +96,60 @@
     if (!("lightLane" in state.ui)) state.ui.lightLane = null;
     if (!("lastExportDay" in state.ui)) state.ui.lastExportDay = null;
     if (!("backupBannerDismissedFor" in state.ui)) state.ui.backupBannerDismissedFor = null;
+    if (!state.touched || typeof state.touched !== "object") state.touched = {};
+    // Phase 4 v1->v2 migration: assign each legacy event a deterministic id
+    // exactly once, then bump the version so it never re-migrates. Runs from
+    // both loadState() and the import path (importBackupText -> normalizeState).
+    if (state.version < 2) {
+      migrateV1();
+      state.version = 2;
+      // Persist the migrated v2 blob ONCE so we never re-migrate. Direct write
+      // (not saveState) keeps this off the sync-push path during load. The ids
+      // are deterministic, so even a re-run would be idempotent — this just
+      // makes "save once, never re-migrate" literal.
+      try { localStorage.setItem(STATE_KEY, JSON.stringify(state)); } catch (e) {}
+    }
+  }
+
+  // Deterministic ids for pre-Phase-4 events: e_{t}_{type}_{courseId||""}_
+  // {session||""}, disambiguated with _2, _3… on collision within the array.
+  function migrateV1() {
+    var seen = {};
+    for (var i = 0; i < state.events.length; i++) {
+      var ev = state.events[i];
+      if (ev.id != null) { seen[ev.id] = true; continue; }
+      var base = "e_" + ev.t + "_" + ev.type + "_" +
+        (ev.courseId || "") + "_" + (ev.session || "");
+      var id = base, n = 2;
+      while (seen[id]) { id = base + "_" + n; n++; }
+      ev.id = id;
+      seen[id] = true;
+    }
+  }
+
+  // Phase 4: unique id for events created at runtime.
+  function genEventId() {
+    return "e_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+  }
+
+  // Phase 4: stamp the last-local-write time on one of the five merge sections.
+  function touch(section) {
+    if (!state.touched) state.touched = {};
+    state.touched[section] = nowISO();
   }
 
   function saveState() {
     try { localStorage.setItem(STATE_KEY, JSON.stringify(state)); }
     catch (e) { /* storage full / blocked — app stays usable this session */ }
+    // Phase 4: a local write queues a background push (no-op until sync is set
+    // up). suppressPush is raised only while we are APPLYING a remote merge, so
+    // pulls never echo back as pushes.
+    if (!suppressPush) schedulePush();
   }
 
   function appendEvent(evt) {
     evt.t = nowISO();
+    if (evt.id == null) evt.id = genEventId();   // Phase 4: union-merge key
     state.events.push(evt);
     saveState();
   }
@@ -697,7 +747,9 @@
     lightSheet: false,      // light-lane chooser open
     addCourseOpen: false,   // add-course panel open on Queue tab
     addCourseTab: "json",   // 'json' | 'manual'
-    addDraft: null          // parsed/edited add-course draft for the confirm step
+    addDraft: null,         // parsed/edited add-course draft for the confirm step
+    // --- Phase 4 ephemeral UI (never persisted) ---
+    syncPanelOpen: false    // the ⚙ Sync panel overlay is open
   };
 
   function checkSession(courseId) {
@@ -709,7 +761,7 @@
     var finished = doneCount(courseId) >= m.sessions;
     if (finished) {
       ui.celebrateId = courseId;
-      if (state.activeCourseId === courseId) { state.activeCourseId = null; saveState(); }
+      if (state.activeCourseId === courseId) { state.activeCourseId = null; touch("activeCourseId"); saveState(); }
       bigConfetti();
     } else {
       confettiBurst();
@@ -721,6 +773,7 @@
     url = (url || "").trim();
     if (!url) return;
     state.overrides.playlistUrls[courseId] = url;
+    touch("overrides");
     saveState();
     render();
   }
@@ -737,6 +790,9 @@
         return;
       }
       state.overrides.sessions[courseId] = n;
+    }
+    if (url || title || (sessionsStr != null && String(sessionsStr).trim() !== "")) {
+      touch("overrides");
     }
     appendEvent({ type: "verifyDone", courseId: courseId });
     render();
@@ -760,6 +816,7 @@
 
   function switchTo(courseId) {
     state.activeCourseId = courseId;
+    touch("activeCourseId");
     saveState();
     ui.pendingConfirm = null; ui.expandedRow = null;
     ui.view = "today";
@@ -768,6 +825,7 @@
 
   function resumeAuto() {
     state.activeCourseId = null;
+    touch("activeCourseId");
     saveState();
     render();
   }
@@ -794,6 +852,7 @@
     title = (title || "").trim();
     if (!title) return;
     state.currentBook = { title: title, startedAt: nowISO() };
+    touch("currentBook");
     saveState();
     ui.bookSheet = false;
     logBookDay();              // first day is logged immediately
@@ -808,6 +867,7 @@
     var title = state.currentBook ? state.currentBook.title : "";
     appendEvent({ type: "bookFinish", title: title });
     state.currentBook = null;
+    touch("currentBook");
     saveState();
     bigConfetti();
     render();
@@ -816,6 +876,7 @@
   // §4 Light lane.
   function chooseLightLane(courseId) {
     state.ui.lightLane = { day: dayKey(), courseId: courseId };
+    touch("ui");
     saveState();
     ui.lightSheet = false;
     ui.view = "today";
@@ -823,6 +884,7 @@
   }
   function clearLightLane() {
     state.ui.lightLane = null;
+    touch("ui");
     saveState();
     render();
   }
@@ -890,6 +952,7 @@
       afterId = q.length ? q[q.length - 1].id : null;
     }
     state.insertedCourses.push({ afterId: afterId, course: course });
+    touch("insertedCourses");
     saveState();
     ui.addCourseOpen = false;
     ui.addDraft = null;
@@ -980,6 +1043,7 @@
     document.body.removeChild(a);
     setTimeout(function () { URL.revokeObjectURL(url); }, 0);
     state.ui.lastExportDay = todayK;
+    touch("ui");
     saveState();
     render();
   }
@@ -1103,6 +1167,7 @@
     else if (ui.view === "week") app.innerHTML = renderWeek();
     else if (ui.view === "stats") app.innerHTML = renderStats();
     else app.innerHTML = renderQueue();
+    renderSyncPanel();             // keep the ⚙ Sync overlay (if open) in step
     wireEvents();
   }
 
@@ -1124,6 +1189,7 @@
       '</div>' +
       '<div class="today-chip' + (tp >= goal ? " met" : "") + '">\u2b50 ' +
         tp + ' / ' + goal + ' today</div>' +
+      syncWidgetHtml() +              // Phase 4 UI touch-point: sync dot + reltime + gear
       '<button class="header-export" data-action="export" title="Export a backup">\ud83d\udcbe</button>';
   }
 
@@ -2022,6 +2088,7 @@
       btn.addEventListener("click", function (e) {
         e.stopPropagation();
         state.ui.yesterdayDismissedFor = dayKey();
+        touch("ui");
         saveState();
         render();
       });
@@ -2067,6 +2134,7 @@
       btn.addEventListener("click", function (e) {
         e.stopPropagation();
         state.ui.backupBannerDismissedFor = dayKey();
+        touch("ui");
         saveState();
         render();
       });
@@ -2226,6 +2294,21 @@
       });
     }
 
+    /* ---- Phase 4: header sync widget ---- */
+    forEachAction("sync-open", function (btn) {
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        ui.syncPanelOpen = true;
+        renderSyncPanel();
+      });
+    });
+    forEachAction("sync-now", function (dot) {
+      dot.addEventListener("click", function (e) {
+        e.stopPropagation();
+        syncNow();
+      });
+    });
+
     // keep clicks inside inputs / open-link from bubbling to row-toggle
     var stoppers = document.querySelectorAll(
       ".paste-input, .vf-url, .vf-sessions, .vf-title, [data-action=open], " +
@@ -2286,12 +2369,575 @@
   function cssEsc(s) { return String(s).replace(/["\\]/g, "\\$&"); }
 
   /* ================================================================== */
+  /* PHASE 4 — CROSS-DEVICE SYNC (private gist, local-first)            */
+  /* ------------------------------------------------------------------ */
+  /* Local-first: every UI action works instantly offline exactly as in */
+  /* Phase 3. Sync is a background layer that never blocks the UI. The   */
+  /* token lives ONLY in lp_sync_v1 — never in lp_state_v1, exports,     */
+  /* logs, or error text (redacted to ghp_…last4 anywhere it surfaces).  */
+  /* Only endpoint: https://api.github.com (gist API).                  */
+  /* ================================================================== */
+
+  var SYNC_KEY  = "lp_sync_v1";
+  var GIST_DESC = "learning-panel-sync";
+  var GIST_FILE = "learning-panel-state.json";
+  var GH_API    = "https://api.github.com";
+
+  // The persisted sync record. { token, gistId, lastSyncedAt, enabled }.
+  var sync = { token: null, gistId: null, lastSyncedAt: null, enabled: false };
+
+  // Background-engine state (never persisted in lp_state_v1).
+  var syncStatus      = "setup";  // setup | syncing | synced | offline | unreadable
+  var lastSyncError   = null;     // plain-words message for the panel (never the token)
+  // suppressPush is declared here; saveState() reads it. Raised only while
+  // APPLYING a remote merge so a pull never echoes back out as a push.
+  var suppressPush    = false;
+  var pushTimer       = null;     // debounce handle
+  var pullTimer       = null;     // 30s-while-visible interval
+  var backoffTimer    = null;     // scheduled retry after a failure
+  var backoffIndex    = 0;        // index into BACKOFFS
+  var pendingPush     = false;    // a local change is waiting to go out
+  var pushInFlight    = false;    // coalesce overlapping pushes
+  var remoteUnreadable = false;   // corrupt remote: stop pushing, keep working
+  var BACKOFFS = [30000, 120000, 300000]; // 30s -> 2m -> 5m
+
+  /* ---- sync-record persistence (separate key; never inside state) ---- */
+  function loadSync() {
+    var raw = null;
+    try { raw = localStorage.getItem(SYNC_KEY); } catch (e) { raw = null; }
+    if (!raw) return;
+    try {
+      var s = JSON.parse(raw);
+      if (s && typeof s === "object") {
+        sync.token = s.token || null;
+        sync.gistId = s.gistId || null;
+        sync.lastSyncedAt = s.lastSyncedAt || null;
+        sync.enabled = !!s.enabled;
+      }
+    } catch (e) { /* corrupt record — treat as not-configured */ }
+  }
+  function saveSync() {
+    try { localStorage.setItem(SYNC_KEY, JSON.stringify(sync)); } catch (e) {}
+  }
+  function syncReady() { return !!(sync.enabled && sync.token && sync.gistId); }
+
+  // The ONLY shape the token may take outside lp_sync_v1.
+  function redactToken(t) {
+    if (!t) return "(none)";
+    return "ghp_\u2026" + String(t).slice(-4);
+  }
+
+  // Error objects carry a .code so we can map to plain words; the message
+  // never contains the token.
+  function mkErr(code, status) {
+    var e = new Error(code + (status ? " " + status : ""));
+    e.code = code; e.status = status || null;
+    return e;
+  }
+
+  /* ---- authenticated fetch helper (api.github.com only) ---- */
+  function gh(method, path, body) {
+    var url = (path.charAt(0) === "/") ? GH_API + path : path;
+    var opts = {
+      method: method,
+      headers: {
+        "Authorization": "token " + sync.token,
+        "Accept": "application/vnd.github+json"
+      }
+    };
+    if (body != null) {
+      opts.body = JSON.stringify(body);
+      opts.headers["Content-Type"] = "application/json";
+    }
+    return fetch(url, opts);
+  }
+
+  /* ---- gist discovery / creation ---- */
+  // GET /gists (paginated) -> id of the gist whose description === GIST_DESC,
+  // or null. So device 1 creates the space; devices 2-3 just reuse the token.
+  function findSyncGist() {
+    var page = 1;
+    function nextPage() {
+      return gh("GET", "/gists?per_page=100&page=" + page).then(function (res) {
+        if (res.status === 401) throw mkErr("bad-token");
+        if (!res.ok) throw mkErr("http", res.status);
+        return res.json().then(function (list) {
+          if (!Array.isArray(list)) return null;
+          for (var i = 0; i < list.length; i++) {
+            if (list[i] && list[i].description === GIST_DESC) return list[i].id;
+          }
+          if (list.length === 100) { page++; return nextPage(); }
+          return null;
+        });
+      });
+    }
+    return nextPage();
+  }
+
+  function createSyncGist() {
+    var files = {};
+    files[GIST_FILE] = { content: JSON.stringify(state) };
+    return gh("POST", "/gists",
+      { description: GIST_DESC, public: false, files: files }
+    ).then(function (res) {
+      if (res.status === 401) throw mkErr("bad-token");
+      if (res.status === 403 || res.status === 404) throw mkErr("no-scope");
+      if (!res.ok) throw mkErr("http", res.status);
+      return res.json().then(function (g) { return g.id; });
+    });
+  }
+
+  // GET the gist file -> { ok:true, remote } | { ok:false, reason:'unreadable' }.
+  // Honours the >1MB truncation guard by fetching raw_url for full content.
+  function fetchRemoteState() {
+    return gh("GET", "/gists/" + sync.gistId).then(function (res) {
+      if (res.status === 401) throw mkErr("bad-token");
+      if (res.status === 404) throw mkErr("gone");
+      if (!res.ok) throw mkErr("http", res.status);
+      return res.json().then(function (g) {
+        var f = g.files && g.files[GIST_FILE];
+        if (!f) return { ok: true, remote: null };          // empty space
+        if (f.truncated && f.raw_url) {
+          return fetch(f.raw_url).then(function (r) { return r.text(); })
+            .then(function (txt) { return parseRemote(txt); });
+        }
+        return parseRemote(f.content);
+      });
+    });
+  }
+  function parseRemote(txt) {
+    if (txt == null || txt === "") return { ok: true, remote: null };
+    try { return { ok: true, remote: JSON.parse(txt) }; }
+    catch (e) { return { ok: false, reason: "unreadable" }; }
+  }
+
+  /* ================================================================== */
+  /* MERGE — phase4-prompt §3, implemented exactly                      */
+  /*   events  = union by event.id, sorted by t (stable; ties keep both) */
+  /*   section = side with later touched[section] (missing => EPOCH);    */
+  /*             take winner's section AND its touched[section]          */
+  /*   version = max(local.version, remote.version)                     */
+  /* Merges NEVER delete events.                                        */
+  /* ================================================================== */
+  var MERGE_SECTIONS = ["overrides", "ui", "currentBook", "insertedCourses", "activeCourseId"];
+
+  function mergeStates(local, remote) {
+    if (!remote || typeof remote !== "object") {
+      return { merged: cloneJSON(local), changed: false };
+    }
+    var out = cloneJSON(local);
+
+    // 1) events: union by id (first occurrence wins => no deletes/dupes),
+    //    stable sort by t (ties keep both, original order preserved).
+    out.events = unionEvents(local.events || [], remote.events || []);
+
+    // 2) per-section last-write-wins
+    var lt = local.touched || {}, rt = remote.touched || {};
+    if (!out.touched) out.touched = {};
+    for (var i = 0; i < MERGE_SECTIONS.length; i++) {
+      var sec = MERGE_SECTIONS[i];
+      var lstamp = lt[sec] || EPOCH;
+      var rstamp = rt[sec] || EPOCH;
+      if (rstamp > lstamp) {                 // remote strictly later -> remote wins
+        out[sec] = cloneJSON(remote[sec]);
+        if (rt[sec]) out.touched[sec] = rt[sec];
+      } else {                               // local wins (ties -> local)
+        out[sec] = cloneJSON(local[sec]);
+        if (lt[sec]) out.touched[sec] = lt[sec];
+      }
+    }
+
+    // 3) version = max
+    out.version = Math.max(local.version || 1, remote.version || 1);
+
+    var changed = stableStringify(out) !== stableStringify(local);
+    return { merged: out, changed: changed };
+  }
+
+  // Union by event.id; first occurrence kept; stable sort by t.
+  function unionEvents(a, b) {
+    var seen = {}, merged = [];
+    function add(arr) {
+      for (var i = 0; i < arr.length; i++) {
+        var ev = arr[i];
+        if (ev == null) continue;
+        var id = (ev.id != null) ? ev.id : ("_noid_" + merged.length);
+        if (seen[id]) continue;              // union: drop the duplicate id
+        seen[id] = true;
+        merged.push(ev);
+      }
+    }
+    add(a); add(b);
+    return merged
+      .map(function (ev, i) { return { ev: ev, i: i }; })
+      .sort(function (p, q) {
+        var tp = p.ev.t || "", tq = q.ev.t || "";
+        if (tp < tq) return -1;
+        if (tp > tq) return 1;
+        return p.i - q.i;                    // stable; ties keep both
+      })
+      .map(function (p) { return p.ev; });
+  }
+
+  function cloneJSON(o) { return (o == null) ? o : JSON.parse(JSON.stringify(o)); }
+
+  // Deterministic stringify (recursively key-sorted) for change detection.
+  function stableStringify(o) { return JSON.stringify(sortKeysDeep(o)); }
+  function sortKeysDeep(o) {
+    if (Array.isArray(o)) return o.map(sortKeysDeep);
+    if (o && typeof o === "object") {
+      var keys = Object.keys(o).sort(), r = {};
+      for (var i = 0; i < keys.length; i++) r[keys[i]] = sortKeysDeep(o[keys[i]]);
+      return r;
+    }
+    return o;
+  }
+
+  // Replace local state with a merged result, persist WITHOUT echoing a push,
+  // and re-render. Caller decides whether anything actually changed.
+  function applyMerged(merged) {
+    suppressPush = true;
+    state = merged;
+    normalizeState();
+    saveState();                 // suppressPush true -> no schedulePush echo
+    suppressPush = false;
+    render();
+  }
+
+  /* ================================================================== */
+  /* SYNC ENGINE (background, local-first)                              */
+  /* ================================================================== */
+
+  // Any local write -> debounce ~2s -> one coalesced read-merge-write.
+  function schedulePush() {
+    if (!syncReady()) return;        // no-op until connected
+    if (remoteUnreadable) return;    // don't clobber a corrupt remote
+    pendingPush = true;
+    if (pushTimer) clearTimeout(pushTimer);
+    pushTimer = setTimeout(function () { pushTimer = null; pushNow(); }, 2000);
+  }
+
+  // read-merge-write: GET gist -> merge remote into local -> PATCH merged back.
+  function pushNow() {
+    if (!syncReady()) return Promise.resolve();
+    if (remoteUnreadable) return Promise.resolve();
+    if (pushInFlight) { pendingPush = true; return Promise.resolve(); }
+    pushInFlight = true;
+    pendingPush = false;
+    setStatus("syncing");
+    return fetchRemoteState().then(function (r) {
+      if (!r.ok && r.reason === "unreadable") { handleUnreadable(); return null; }
+      var res = mergeStates(state, r.remote);
+      if (res.changed) applyMerged(res.merged);
+      var files = {};
+      files[GIST_FILE] = { content: JSON.stringify(state) };
+      return gh("PATCH", "/gists/" + sync.gistId, { files: files }).then(function (resp) {
+        if (resp.status === 401) throw mkErr("bad-token");
+        if (!resp.ok) throw mkErr("http", resp.status);
+        markSynced();
+      });
+    }).then(function () {
+      pushInFlight = false;
+      if (pendingPush) schedulePush();     // a change landed mid-flight
+    }).catch(function (err) {
+      pushInFlight = false;
+      handleSyncError(err);
+    });
+  }
+
+  // Pull: GET gist -> merge into local -> save+render only if changed.
+  function pullNow() {
+    if (!syncReady()) return Promise.resolve();
+    return fetchRemoteState().then(function (r) {
+      if (!r.ok && r.reason === "unreadable") { handleUnreadable(); return; }
+      var res = mergeStates(state, r.remote);
+      if (res.changed) applyMerged(res.merged);
+      markSynced();
+    }).catch(function (err) { handleSyncError(err); });
+  }
+
+  // Tapping the dot / "Sync now": push out any local change (which read-merges).
+  function syncNow() { if (syncReady()) pushNow(); }
+
+  function markSynced() {
+    sync.lastSyncedAt = nowISO();
+    saveSync();
+    lastSyncError = null;
+    remoteUnreadable = false;            // a clean round-trip means readable again
+    backoffIndex = 0;
+    if (backoffTimer) { clearTimeout(backoffTimer); backoffTimer = null; }
+    setStatus("synced");
+  }
+
+  function setStatus(s) {
+    syncStatus = s;
+    updateSyncWidget();
+    if (ui.syncPanelOpen) renderSyncPanel();
+  }
+
+  function handleSyncError(err) {
+    if (err && err.code === "bad-token") {
+      lastSyncError = "That token was rejected \u2014 check it and reconnect.";
+      setStatus("offline"); return;
+    }
+    if (err && err.code === "no-scope") {
+      lastSyncError = "This token needs the \u2018gist\u2019 scope.";
+      setStatus("offline"); return;
+    }
+    if (err && err.code === "gone") {
+      lastSyncError = "Sync space not found \u2014 reconnect to recreate it.";
+      setStatus("offline"); return;
+    }
+    // network / http / unknown: silent, gray dot, queue the push, back off.
+    lastSyncError = null;
+    pendingPush = true;
+    setStatus("offline");
+    scheduleBackoff();
+  }
+
+  function scheduleBackoff() {
+    if (backoffTimer) return;            // one retry already armed
+    var wait = BACKOFFS[Math.min(backoffIndex, BACKOFFS.length - 1)];
+    backoffIndex++;
+    backoffTimer = setTimeout(function () {
+      backoffTimer = null;
+      if (syncReady()) pushNow();        // retry the queued change
+    }, wait);
+  }
+
+  // Corrupt remote JSON: do NOT clobber it. Stop pushing, surface the message,
+  // keep working locally. A later successful round-trip clears the flag.
+  function handleUnreadable() {
+    remoteUnreadable = true;
+    lastSyncError = "Sync space unreadable \u2014 export a backup and reconnect.";
+    setStatus("unreadable");
+  }
+
+  /* ---- pull triggers ---- */
+  function startPullInterval() {
+    stopPullInterval();
+    pullTimer = setInterval(function () {
+      if (document.visibilityState === "visible" && syncReady()) pullNow();
+    }, 30000);                           // every 30s while visible only
+  }
+  function stopPullInterval() {
+    if (pullTimer) { clearInterval(pullTimer); pullTimer = null; }
+  }
+
+  var syncListenersWired = false;
+  function initSyncListeners() {
+    if (syncListenersWired) return;
+    syncListenersWired = true;
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible" && syncReady()) pullNow();
+    });
+    window.addEventListener("focus", function () { if (syncReady()) pullNow(); });
+    window.addEventListener("online", function () {
+      if (syncReady()) { if (pendingPush) pushNow(); else pullNow(); }
+    });
+  }
+
+  /* ---- connect / disconnect ---- */
+  function syncConnect(token) {
+    token = (token || "").trim();
+    if (!token) {
+      lastSyncError = "Paste a token first.";
+      if (ui.syncPanelOpen) renderSyncPanel();
+      return;
+    }
+    sync.token = token;
+    sync.enabled = true;
+    remoteUnreadable = false;
+    lastSyncError = null;
+    setStatus("syncing");
+    findSyncGist().then(function (id) {
+      if (id) { sync.gistId = id; saveSync(); return pullNow(); }   // found -> pull/merge
+      return createSyncGist().then(function (newId) {               // not found -> create
+        sync.gistId = newId; saveSync(); markSynced();
+      });
+    }).then(function () {
+      saveSync();
+      startPullInterval();
+      if (ui.syncPanelOpen) renderSyncPanel();
+    }).catch(handleConnectError);
+  }
+
+  function handleConnectError(err) {
+    if (err && err.code === "bad-token")
+      lastSyncError = "That token was rejected \u2014 double-check you pasted it correctly.";
+    else if (err && err.code === "no-scope")
+      lastSyncError = "This token needs the \u2018gist\u2019 scope to create your sync space.";
+    else
+      lastSyncError = "Couldn\u2019t reach GitHub just now \u2014 check your connection and try again.";
+    setStatus(sync.gistId ? "offline" : "setup");
+    if (ui.syncPanelOpen) renderSyncPanel();
+  }
+
+  // Disconnect: clear lp_sync_v1 ONLY. Local state untouched.
+  function syncDisconnect() {
+    if (pushTimer) { clearTimeout(pushTimer); pushTimer = null; }
+    if (backoffTimer) { clearTimeout(backoffTimer); backoffTimer = null; }
+    stopPullInterval();
+    sync = { token: null, gistId: null, lastSyncedAt: null, enabled: false };
+    try { localStorage.removeItem(SYNC_KEY); } catch (e) {}
+    backoffIndex = 0; pendingPush = false; remoteUnreadable = false; lastSyncError = null;
+    setStatus("setup");
+    if (ui.syncPanelOpen) renderSyncPanel();
+  }
+
+  function initSync() {
+    loadSync();
+    initSyncListeners();
+    if (syncReady()) {
+      setStatus("syncing");
+      startPullInterval();
+      pullNow();                          // pull on app load
+    } else if (sync.token && sync.enabled && !sync.gistId) {
+      syncConnect(sync.token);            // token saved but discovery didn't finish
+    } else {
+      setStatus("setup");
+    }
+  }
+
+  /* ================================================================== */
+  /* SYNC UI — header widget (dot + relative time + gear) and panel     */
+  /* ================================================================== */
+
+  function relTime(iso) {
+    if (!iso) return "never";
+    var diff = Date.now() - new Date(iso).getTime();
+    if (diff < 0) diff = 0;
+    var s = Math.floor(diff / 1000);
+    if (s < 10) return "just now";
+    if (s < 60) return s + "s ago";
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + "m ago";
+    var h = Math.floor(m / 60);
+    if (h < 24) return h + "h ago";
+    return Math.floor(h / 24) + "d ago";
+  }
+
+  function dotClass() {
+    if (syncStatus === "synced") return "ok";
+    if (syncStatus === "syncing") return "busy";
+    if (syncStatus === "unreadable") return "err";
+    return "off";                          // setup / offline
+  }
+  function statusText() {
+    if (syncStatus === "synced") return "Synced \u00b7 " + relTime(sync.lastSyncedAt);
+    if (syncStatus === "syncing") return "Syncing\u2026";
+    if (syncStatus === "unreadable") return "Sync space unreadable";
+    if (syncStatus === "offline") return "Offline \u2014 will sync when back";
+    return "Sync off";
+  }
+  function statusTitle() {
+    if (!syncReady()) return "Sync is off \u2014 click \u2699 to set it up";
+    if (syncStatus === "synced")
+      return "Last synced " + relTime(sync.lastSyncedAt) + " \u2014 click the dot to sync now";
+    return "Click the dot to sync now";
+  }
+
+  function syncWidgetHtml() {
+    return '<div class="sync-widget" title="' + escapeHtml(statusTitle()) + '">' +
+        '<span class="sync-dot ' + dotClass() + '" data-action="sync-now"></span>' +
+        '<span class="sync-text">' + escapeHtml(statusText()) + '</span>' +
+        '<button class="sync-gear" data-action="sync-open" title="Sync settings">\u2699</button>' +
+      '</div>';
+  }
+
+  // In-place refresh of the header widget so existing listeners survive and no
+  // full re-render is needed for a status tick.
+  function updateSyncWidget() {
+    var w = document.querySelector(".sync-widget");
+    if (!w) return;
+    var dot = w.querySelector(".sync-dot");
+    var txt = w.querySelector(".sync-text");
+    if (dot) dot.className = "sync-dot " + dotClass();
+    if (txt) txt.textContent = statusText();
+    w.setAttribute("title", statusTitle());
+  }
+
+  function renderSyncPanel() {
+    var existing = document.getElementById("sync-overlay");
+    if (!ui.syncPanelOpen) {
+      if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+      return;
+    }
+    var overlay = existing;
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.id = "sync-overlay";
+      document.body.appendChild(overlay);
+    }
+    overlay.innerHTML = syncPanelHtml();
+    wireSyncPanel(overlay);
+  }
+
+  function syncPanelHtml() {
+    var connected = syncReady();
+    var statusLine = connected ? ("Connected. " + statusText())
+      : (sync.token ? "Not connected yet." : "Not set up.");
+    var err = lastSyncError ? '<div class="sync-err">' + escapeHtml(lastSyncError) + "</div>" : "";
+    var tokenHint = sync.token
+      ? '<div class="sync-tokenhint">Token on file: ' + escapeHtml(redactToken(sync.token)) + "</div>"
+      : "";
+    var actions = connected
+      ? '<button class="sync-btn primary" data-action="sync-syncnow">Sync now</button>' +
+        '<button class="sync-btn" data-action="sync-disconnect">Disconnect</button>'
+      : '<button class="sync-btn primary" data-action="sync-connect">Connect</button>';
+
+    return '' +
+      '<div class="sync-panel" role="dialog" aria-label="Sync settings">' +
+        '<div class="sync-panel-head">' +
+          '<h2>Sync across your devices</h2>' +
+          '<button class="sync-close" data-action="sync-close" title="Close">\u00d7</button>' +
+        '</div>' +
+        '<p class="sync-blurb">Your progress stays on this device and quietly copies ' +
+          'to a private GitHub gist so your other devices stay in step. Paste a GitHub ' +
+          'token with the <strong>gist</strong> scope. Use the same token on each device.</p>' +
+        (connected ? "" :
+          '<label class="sync-label">GitHub token' +
+            '<input type="password" class="sync-token" autocomplete="off" ' +
+              'placeholder="ghp_\u2026" spellcheck="false"></label>') +
+        tokenHint +
+        '<div class="sync-status-line">' + escapeHtml(statusLine) + "</div>" +
+        err +
+        '<div class="sync-actions">' + actions + "</div>" +
+        '<p class="sync-foot">The token is stored only on this device and is never ' +
+          'included in your exported backups.</p>' +
+      "</div>";
+  }
+
+  function wireSyncPanel(root) {
+    var close = root.querySelector('[data-action="sync-close"]');
+    if (close) close.addEventListener("click", function () {
+      ui.syncPanelOpen = false; renderSyncPanel();
+    });
+    root.addEventListener("click", function (e) {
+      if (e.target === root) { ui.syncPanelOpen = false; renderSyncPanel(); }  // backdrop
+    });
+    var connectBtn = root.querySelector('[data-action="sync-connect"]');
+    if (connectBtn) connectBtn.addEventListener("click", function () {
+      var input = root.querySelector(".sync-token");
+      syncConnect(input ? input.value : "");
+    });
+    var syncNowBtn = root.querySelector('[data-action="sync-syncnow"]');
+    if (syncNowBtn) syncNowBtn.addEventListener("click", function () { syncNow(); });
+    var disc = root.querySelector('[data-action="sync-disconnect"]');
+    if (disc) disc.addEventListener("click", function () {
+      if (confirm("Disconnect sync on this device? Your local progress stays; only the saved token is removed."))
+        syncDisconnect();
+    });
+  }
+
+  /* ================================================================== */
   /* BOOT                                                                */
   /* ================================================================== */
 
   function boot() {
     loadState();
     render();
+    initSync();        // Phase 4: load lp_sync_v1, wire pull triggers, pull on load
   }
 
   if (document.readyState === "loading") {
@@ -2306,7 +2952,16 @@
     dayKey: dayKey, computeQueue: computeQueue, currentCourse: currentCourse,
     doneCount: doneCount, pointsToday: pointsToday, overallProgress: overallProgress,
     dailySummaries: dailySummaries, streakInfo: streakInfo,
-    render: render
+    render: render,
+    // Phase 4 (debugging / cross-profile testing only — never exposes the token)
+    mergeStates: mergeStates, pullNow: pullNow, pushNow: pushNow,
+    syncInfo: function () {
+      return {
+        status: syncStatus, enabled: sync.enabled, hasToken: !!sync.token,
+        gistId: sync.gistId, lastSyncedAt: sync.lastSyncedAt,
+        token: redactToken(sync.token)
+      };
+    }
   };
 
   /* ------------------------------------------------------------------ */
@@ -2323,6 +2978,7 @@
         d.setHours(12, 0, 0, 0);
         d.setDate(d.getDate() - daysAgo);
         state.events.push({
+          id: genEventId(),
           type: "session",
           courseId: courseId,
           session: start + i + 1,
@@ -2346,6 +3002,7 @@
         if (s >= 1) ctx.push(s);
       }
       state.events.push({
+        id: genEventId(),
         type: "persist",
         courseId: courseId,
         session: session,
